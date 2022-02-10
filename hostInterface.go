@@ -20,90 +20,135 @@ import (
 // the hosts address gets isntalled on the macvlan
 type HostInterface struct {
 	VxlanParams *Vxlan
-	vxLink      netlink.Link
+	vxLink      *netlink.Vxlan
 	vxName      string
-	mvLink      netlink.Link
+	mvLink      *netlink.Macvlan
 	mvName      string
+}
+
+func newHostInterfaceShell(vxlan *Vxlan) *HostInterface {
+	vxName := "vx_" + vxlan.Name
+	mvName := "mv_" + vxlan.Name
+
+	return &HostInterface{
+		VxlanParams: vxlan,
+		vxName:      vxName,
+		mvName:      mvName,
+	}
 }
 
 // GetOrCreateHostInterface creates required host interfaces if they don't exist, or gets them if they already do
 func GetOrCreateHostInterface(vxlan *Vxlan) (*HostInterface, error) {
-	hi, _ := getHostInterface(vxlan)
-	gateway := hi.GetGateway()
-
-	if hi.vxLink != nil && hi.mvLink != nil && hi.hasAddress(gateway) {
+	hi, err := GetHostInterface(vxlan)
+	if err == nil {
 		log.Debugf("found existing host interface, returning")
 		return hi, nil
 	}
 
-	//host interface is incomplete, try to rebuild it
-	if hi.vxLink == nil {
-		log.Debugf("%v interface nil, creating", hi.vxName)
-		err := hi.createVxlanLink()
-		if err != nil {
-			return nil, err
-		}
-	}
+	return createHostInterface(vxlan)
+}
 
-	if hi.mvLink == nil {
-		log.Debugf("%v interface nil, creating", hi.mvName)
-		hmvl, err := hi.createMacvlanLink(hi.mvName)
-		if err != nil {
-			return nil, err
-		}
+func createHostInterface(vxlan *Vxlan) (*HostInterface, error) {
+	hi := newHostInterfaceShell(vxlan)
 
-		log.Debugf("initializing %v interface", hi.mvName)
-		err = hi.initializeMacvlanLink(hmvl, hi.GetGateway(), netns.None(), "")
-		if err != nil {
-			return nil, err
-		}
-
-		hi.mvLink = hmvl
-	}
-
-	log.Debugf("validating/adding bypass route")
-	err := hi.checkOrAddBypassRoute()
+	err := hi.createVxlanLink()
 	if err != nil {
-		return hi, err
+		log.Error("failed to create vxlan link")
+		hi.DeleteLinks()
+		return nil, err
 	}
 
-	log.Debugf("validating/adding bypass rule")
-	err = hi.checkOrAddRule()
+	hi.mvLink, err = hi.createMacvlanLink(hi.mvName)
 	if err != nil {
-		return hi, err
+		log.Error("failed to create host macvlan link")
+		hi.DeleteLinks()
+		return nil, err
 	}
 
-	if !hi.hasAddress(gateway) {
-		log.Debugf("%v interface missing gateway address, adding", hi.mvName)
-		return hi, netlink.AddrAdd(hi.mvLink, &netlink.Addr{IPNet: hi.GetGateway()})
+	err = hi.initializeMacvlanLink(hi.mvLink, hi.GetContainerGateway(), netns.None(), "")
+	if err != nil {
+		log.Error("failed to initialize host macvlan link")
+		hi.DeleteLinks()
+		return nil, err
+	}
+
+	err = hi.addBypassRoute()
+	if err != nil {
+		log.Error("failed validating/adding bypass route")
+		hi.DeleteLinks()
+		return nil, err
+	}
+
+	err = hi.addBypassRule()
+	if err != nil {
+		log.Error("failed validating/adding bypass rule")
+		hi.DeleteLinks()
+		return nil, err
 	}
 
 	return hi, nil
 }
 
-func (hi *HostInterface) checkOrAddRule() error {
-	log.Debugf("checkOrAddRule()")
-	net := iputil.NetworkID(hi.GetGateway())
+func GetHostInterface(vxlan *Vxlan) (*HostInterface, error) {
+	var err error
+	hi := newHostInterfaceShell(vxlan)
 
-	rules, err := netlink.RuleList(0)
+	var link netlink.Link
+	link, err = netlink.LinkByName(hi.vxName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	for _, r := range rules {
-		if iputil.SubnetEqualSubnet(r.Src, net) && iputil.SubnetEqualSubnet(r.Dst, net) && r.Table == DefaultVxlanRouteTable {
-			log.Debugf("rule found, return")
-			return nil
-		}
+	var ok bool
+	hi.vxLink, ok = link.(*netlink.Vxlan)
+	if !ok {
+		hi.DeleteLinks()
+		return nil, fmt.Errorf("link named %v is not a vxlan", hi.vxName)
 	}
 
+	link, err = netlink.LinkByName(hi.mvName)
+	if err != nil {
+		hi.DeleteLinks()
+		return nil, err
+	}
+
+	hi.mvLink, ok = link.(*netlink.Macvlan)
+	if !ok {
+		hi.DeleteLinks()
+		return nil, fmt.Errorf("link named %v is not a macvlan", hi.mvName)
+	}
+
+	address, err := netlink.ParseAddr(vxlan.Cidr)
+	if err != nil {
+		hi.DeleteLinks()
+		return nil, err
+	}
+
+	if !linkHasAddress(hi.mvLink, address) {
+		hi.DeleteLinks()
+		return nil, fmt.Errorf("host macvlan link does not have expected address")
+	}
+
+	return hi, nil
+}
+
+func (hi *HostInterface) addBypassRule() error {
+	log.Debugf("addBypassRule()")
+
+	r, _ := hi.getBypassRule()
+	if r != nil {
+		log.Debugf("rule already exists")
+		return nil
+	}
+
+	net := iputil.NetworkID(hi.GetContainerGateway())
 	log.Debugf("add rule")
 	rule := netlink.NewRule()
 	rule.Src = net
 	rule.Dst = net
 	rule.Table = DefaultVxlanRouteTable
 
-	err = netlink.RuleAdd(rule)
+	err := netlink.RuleAdd(rule)
 	if err != nil {
 		log.WithError(err).Errorf("failed to add rule")
 		return err
@@ -112,46 +157,85 @@ func (hi *HostInterface) checkOrAddRule() error {
 	return nil
 }
 
-func (hi *HostInterface) checkOrAddBypassRoute() error {
-	log.Debugf("checkOrAddBypassRoute()")
-	net := iputil.NetworkID(hi.GetGateway())
+func (hi *HostInterface) getBypassRule() (*netlink.Rule, error) {
+	log.Debugf("getBypassRule()")
 
-	routes, err := netlink.RouteListFiltered(0, &netlink.Route{Table: DefaultVxlanRouteTable}, netlink.RT_FILTER_TABLE)
+	rules, err := netlink.RuleList(0)
+	if err != nil {
+		return nil, err
+	}
+
+	net := iputil.NetworkID(hi.GetContainerGateway())
+	for _, r := range rules {
+		if iputil.SubnetEqualSubnet(r.Src, net) && iputil.SubnetEqualSubnet(r.Dst, net) && r.Table == DefaultVxlanRouteTable {
+			return &r, nil
+		}
+	}
+
+	return nil, fmt.Errorf("bypass rule not found")
+}
+
+func (hi *HostInterface) delBypassRule() error {
+	log.Debugf("delBypassRule()")
+
+	r, err := hi.getBypassRule()
 	if err != nil {
 		return err
 	}
 
-	for _, r := range routes {
-		if iputil.SubnetEqualSubnet(r.Dst, net) && r.LinkIndex == hi.mvLink.Attrs().Index {
-			log.Debugf("bypass route found, return")
-			return nil
-		}
+	return netlink.RuleDel(r)
+}
+
+func (hi *HostInterface) addBypassRoute() error {
+	log.Debugf("addBypassRoute()")
+	net := iputil.NetworkID(hi.GetContainerGateway())
+
+	r, _ := hi.getBypassRoute()
+	if r != nil {
+		log.Debugf("bypass route already exists, return")
+		return nil
 	}
 
-	log.Debugf("add bypass route")
-	err = netlink.RouteAdd(&netlink.Route{
-		LinkIndex: hi.mvLink.Attrs().Index,
+	err := netlink.RouteAdd(&netlink.Route{
+		LinkIndex: hi.mvLink.Index,
 		Dst:       net,
 		Table:     DefaultVxlanRouteTable,
 	})
 	if err != nil {
-		log.WithError(err).Errorf("failed to add vxlan bypass route")
+		log.WithError(err).Errorf("failed to add bypass route")
 		return err
 	}
 
 	return nil
 }
 
-func (hi *HostInterface) hasAddress(addr *net.IPNet) bool {
-	addrs, _ := netlink.AddrList(hi.mvLink, 0)
+func (hi *HostInterface) getBypassRoute() (*netlink.Route, error) {
+	log.Debugf("getBypassRoute()")
 
-	for _, a := range addrs {
-		if a.IP.Equal(addr.IP) && a.Mask.String() == addr.Mask.String() {
-			return true
+	routes, err := netlink.RouteListFiltered(0, &netlink.Route{Table: DefaultVxlanRouteTable}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return nil, err
+	}
+
+	net := iputil.NetworkID(hi.GetContainerGateway())
+	for _, r := range routes {
+		if iputil.SubnetEqualSubnet(r.Dst, net) && r.LinkIndex == hi.mvLink.Index {
+			return &r, nil
 		}
 	}
 
-	return false
+	return nil, fmt.Errorf("bypass route not found")
+}
+
+func (hi *HostInterface) delBypassRoute() error {
+	log.Debugf("delBypassRoute()")
+
+	r, err := hi.getBypassRoute()
+	if err != nil {
+		return err
+	}
+
+	return netlink.RouteDel(r)
 }
 
 func (hi *HostInterface) createVxlanLink() error {
@@ -241,13 +325,12 @@ func (hi *HostInterface) createMacvlanLink(name string) (*netlink.Macvlan, error
 	nl := &netlink.Macvlan{
 		LinkAttrs: netlink.LinkAttrs{
 			Name:        name,
-			ParentIndex: hi.vxLink.Attrs().Index,
+			ParentIndex: hi.vxLink.Index,
 		},
 		Mode: netlink.MACVLAN_MODE_BRIDGE,
 	}
 
-	var err error
-	err = netlink.LinkAdd(nl)
+	err := netlink.LinkAdd(nl)
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +380,7 @@ func (hi *HostInterface) initializeMacvlanLink(nl *netlink.Macvlan, addr *net.IP
 		_, defaultDst, _ := net.ParseCIDR("0.0.0.0/0")
 		err = netlink.RouteAdd(&netlink.Route{
 			Dst: defaultDst,
-			Gw:  hi.GetGateway().IP,
+			Gw:  hi.GetContainerGateway().IP,
 		})
 		if err != nil {
 			return err
@@ -313,8 +396,8 @@ func (hi *HostInterface) GetOption(opt string) (string, bool) {
 	return val, ok
 }
 
-//GetGateway gets the gateway address and subnet from the vxlan config
-func (hi *HostInterface) GetGateway() *net.IPNet {
+//GetContainerGateway gets the gateway address and subnet from the vxlan config
+func (hi *HostInterface) GetContainerGateway() *net.IPNet {
 	ipnet, _ := netlink.ParseIPNet(hi.VxlanParams.Cidr)
 	return ipnet
 }
@@ -322,7 +405,12 @@ func (hi *HostInterface) GetGateway() *net.IPNet {
 //AddContainerLink adds a new macvlan link to the vxlan link, adds an IP, and puts it in the requested namespace.
 func (hi *HostInterface) AddContainerLink(namespace, ifname string, addr *net.IPNet) (int, error) {
 	cns, err := netns.GetFromPath(namespace)
-	defer cns.Close()
+	defer func() {
+		err := cns.Close()
+		if err != nil {
+			log.Debugf("error while closing container namespace: %v", err)
+		}
+	}()
 	if err != nil {
 		return -1, err
 	}
@@ -384,12 +472,74 @@ func (hi *HostInterface) DeleteContainerLink(namespace, name string) error {
 	return netns.Set(rootns)
 }
 
-//Delete removes the components of the host interface from the host
-func (hi *HostInterface) Delete() error {
-	log.Debugf("HostInterface.Delete()")
-	//TODO:
-	//remove bypass rule
-	//remove bypass route
-	//delete vxlan (should cascade delete address and macvlan)
-	return nil
+//DeleteLinks removes the components of the host interface from the host
+func (hi *HostInterface) DeleteLinks() {
+	log.Debugf("HostInterface.DeleteLinks()")
+	err := hi.delBypassRule()
+	if err != nil {
+		log.Errorf("failed to delete bypass rule: %v", err)
+	}
+	err = hi.delBypassRoute()
+	if err != nil {
+		log.Errorf("failed to delete bypass route: %v", err)
+	}
+
+	if hi.mvLink != nil {
+		err = netlink.LinkDel(hi.mvLink)
+		if err != nil {
+			log.Errorf("failed to delete macvlan link: %v", err)
+		}
+		hi.mvLink = nil
+	}
+
+	if hi.vxLink != nil {
+		err = netlink.LinkDel(hi.vxLink)
+		if err != nil {
+			log.Errorf("failed to delete vxlan link: %v", err)
+		}
+		hi.vxLink = nil
+	}
+}
+
+func (hi *HostInterface) NumContainers() (int, error) {
+
+	namespaces, err := getNetworkNamespaces()
+	if err != nil {
+		return -1, err
+	}
+
+	numChildren := 0
+	for _, ns := range namespaces {
+		log.Debugf("checking for interfaces in namespace at %v", ns)
+		nsh, err := netns.GetFromPath(ns)
+		if err != nil {
+			log.WithError(err).Errorf("failed to get namespace at %v", ns)
+			return -1, err
+		}
+		defer func() {
+			err := nsh.Close()
+			if err != nil {
+				log.WithError(err).Errorf("failed to close namespace at %v", ns)
+			}
+		}()
+		nlh, err := netlink.NewHandleAt(nsh, netlink.FAMILY_ALL)
+		if err != nil {
+			log.Errorf("failed to get netlink handle in namespace at %v", ns)
+			return -1, err
+		}
+
+		links, err := nlh.LinkList()
+		if err != nil {
+			return -1, err
+		}
+		for _, link := range links {
+			if link.Attrs().ParentIndex == hi.vxLink.Index {
+				if link.Attrs().Index != hi.mvLink.Index {
+					numChildren++
+				}
+			}
+		}
+	}
+
+	return numChildren, nil
 }

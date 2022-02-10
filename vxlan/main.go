@@ -186,31 +186,30 @@ func main() {
 			Sandbox: vars.NetworkNamespace,
 		})
 
-		result.IPs[0].Gateway = hi.GetGateway().IP.String()
+		result.IPs[0].Gateway = hi.GetContainerGateway().IP.String()
 		result.IPs[0].Interface = &li
 
 		result.Routes = append(result.Routes, &cni.Route{
 			Destination: "0.0.0.0/0",
-			Gateway:     hi.GetGateway().IP.String(),
+			Gateway:     hi.GetContainerGateway().IP.String(),
 		})
 
 		exitOutput = result.Marshal()
 		return
 	case "DEL":
 		log.Debugf("getting host interface")
-		//get/create host interface
-		hi, err := vxlan.GetOrCreateHostInterface(vxlp)
+
+		hi, err := vxlan.GetHostInterface(vxlp)
 		if err != nil {
-			log.WithError(err).Errorf("failed to get or create host interface during DEL")
+			log.WithError(err).Errorf("failed to get host interface during DEL")
+			return
 		}
 
-		if hi != nil {
-			log.Debugf("deleting container link")
-			//delete cmvl
-			err = hi.DeleteContainerLink(vars.NetworkNamespace, vars.ContainerInterface)
-			if err != nil {
-				log.WithError(err).Errorf("failed to delete container link")
-			}
+		log.Debugf("deleting container link")
+		//delete cmvl
+		err = hi.DeleteContainerLink(vars.NetworkNamespace, vars.ContainerInterface)
+		if err != nil {
+			log.WithError(err).Errorf("failed to delete container link")
 		}
 
 		if conf.PreviousResult != nil && len(conf.PreviousResult.IPs) > 0 && conf.PreviousResult.IPs[0].Address != "" {
@@ -220,11 +219,19 @@ func main() {
 			}
 		}
 
+		nc, err := hi.NumContainers()
+		if err != nil {
+			log.WithError(err).Errorf("failed getting number of containers")
+			log.Warningf("leaving host interface in-tact")
+			return
+		}
+		log.Debugf("found %v containers on vxlan %v", nc, hi.VxlanParams.Name)
+		if nc == 0 {
+			hi.DeleteLinks()
+		}
+
 		//success
 		return
-		//TODO:
-		//if last cmvl
-		//delete host interface
 	case "CHECK":
 		return
 		//if all "ADD" steps are correct
