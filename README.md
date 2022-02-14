@@ -22,4 +22,4 @@ Features:
 
 
 
-The networking concepts and some of this code were inspired by and are originally from [here](https://github.com/TrilliumIT/vxrouter)
+The networking concepts and some of this code were inspired by and are originally from [here](https://github.com/TrilliumIT/vxrouter) and later forked from [here](https://github.com/phdata/vxlan-cni)

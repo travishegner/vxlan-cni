@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/TrilliumIT/iputil"
-	cni "github.com/phdata/go-libcni"
-	"github.com/phdata/vxlan-cni"
 	log "github.com/sirupsen/logrus"
+	cni "github.com/travishegner/go-libcni"
+	"github.com/travishegner/vxlan-cni"
 	"github.com/vishvananda/netlink"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"

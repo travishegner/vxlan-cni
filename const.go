@@ -14,8 +14,8 @@ const (
 	DefaultVxlanRouteTable = 192
 
 	//NetworkAnnotation is the string key where we search for the name of the vxlan to join
-	NetworkAnnotation = "vxlan-cni.phdata.io/NetworkName"
+	NetworkAnnotation = "vxlan-cni.travishegner.com/NetworkName"
 
 	//AddressAnnotation is the string key where we search for the IP address requested
-	AddressAnnotation = "vxlan-cni.phdata.io/RequestedAddress"
+	AddressAnnotation = "vxlan-cni.travishegner.com/RequestedAddress"
 )

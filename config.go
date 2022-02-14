@@ -3,7 +3,7 @@ package vxlan
 import (
 	"encoding/json"
 
-	cni "github.com/phdata/go-libcni"
+	cni "github.com/travishegner/go-libcni"
 )
 
 // Config is the cni config extended with our required attributes
