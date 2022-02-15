@@ -211,13 +211,20 @@ func (hi *HostInterface) addBypassRoute() error {
 
 func (hi *HostInterface) getBypassRoute() (*netlink.Route, error) {
 	log.Debugf("getBypassRoute()")
+	net := iputil.NetworkID(hi.GetContainerGateway())
 
-	routes, err := netlink.RouteListFiltered(0, &netlink.Route{Table: DefaultVxlanRouteTable}, netlink.RT_FILTER_TABLE)
+	routes, err := netlink.RouteListFiltered(
+		netlink.FAMILY_ALL,
+		&netlink.Route{
+			Table: DefaultVxlanRouteTable,
+			Dst:   net,
+		},
+		netlink.RT_FILTER_TABLE|netlink.RT_FILTER_DST,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	net := iputil.NetworkID(hi.GetContainerGateway())
 	for _, r := range routes {
 		if iputil.SubnetEqualSubnet(r.Dst, net) && r.LinkIndex == hi.mvLink.Index {
 			return &r, nil
