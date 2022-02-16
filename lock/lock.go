@@ -1,4 +1,4 @@
-package vxlan
+package lock
 
 import (
 	"os"
@@ -14,8 +14,8 @@ type Lock struct {
 }
 
 //NewLock returns a new Lock
-func NewLock(name string) (*Lock, error) {
-	fm, err := filemutex.New(DefaultLockPath + string(os.PathSeparator) + "vxlan-" + name + DefaultLockExt)
+func NewLock(name, path, ext string) (*Lock, error) {
+	fm, err := filemutex.New(path + string(os.PathSeparator) + "vxlan-" + name + ext)
 	if err != nil {
 		return nil, err
 	}
