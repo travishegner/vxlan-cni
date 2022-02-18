@@ -13,11 +13,13 @@ import (
 	cni "github.com/travishegner/go-libcni"
 )
 
+//Ipam represents the cni ipam driver our vxlan plugin will use
 type Ipam struct {
 	bin     string
 	timeout time.Duration
 }
 
+//New returns a new ipam instance
 func New(bin string, timeout time.Duration) *Ipam {
 	return &Ipam{
 		bin:     bin,
@@ -25,8 +27,11 @@ func New(bin string, timeout time.Duration) *Ipam {
 	}
 }
 
+//Add will execute the ipam driver with an ADD command, populating env variables
+//for which IP and/or network, link index, and whether to exclude addresses from the
+//beginning or end of the range
 func (i *Ipam) Add(addr *net.IPNet, linkIndex, xf, xl int) (*cni.Result, error) {
-	log.Debugf("executing IPAM ADD")
+	log.Debugf("i.Add(%v, %v, %v, %v)", addr, linkIndex, xf, xl)
 	ctx, cancel := context.WithTimeout(context.Background(), i.timeout)
 	defer cancel()
 
@@ -35,22 +40,23 @@ func (i *Ipam) Add(addr *net.IPNet, linkIndex, xf, xl int) (*cni.Result, error) 
 
 	out, err := cmd.Output()
 	if err != nil {
-		log.WithError(err).Debugf("failure while executing ipam")
-		return nil, err
+		return nil, fmt.Errorf("failure while executing ipam: %w", err)
 	}
 
 	result := &cni.Result{}
 	err = json.Unmarshal(out, result)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal ipam output: %w", err)
 	}
 
 	return result, nil
 }
 
+//Del will execute the cni ipam driver with a DEL command pipulating
+//env variables for previously issued addresses and their link index
 func (i *Ipam) Del(addr *net.IPNet, linkIndex int) error {
-	log.Debugf("executing IPAM DEL")
-	//remove /32 route
+	log.Debugf("i.Del(%v, %v)", addr, linkIndex)
+
 	ctx, cancel := context.WithTimeout(context.Background(), i.timeout)
 	defer cancel()
 
@@ -59,13 +65,7 @@ func (i *Ipam) Del(addr *net.IPNet, linkIndex int) error {
 
 	err := cmd.Run()
 	if err != nil {
-		log.WithError(err).Errorf("error while executing IPAM plugin during DEL")
-		return err
-	}
-
-	if ctx.Err() == context.DeadlineExceeded {
-		log.WithError(ctx.Err()).Errorf("timeout while executing IPAM plugin during DEL")
-		return ctx.Err()
+		return fmt.Errorf("failed while executing ipam delete: %w", err)
 	}
 
 	return nil

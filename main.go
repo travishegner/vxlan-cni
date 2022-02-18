@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"github.com/TrilliumIT/iputil"
 	log "github.com/sirupsen/logrus"
@@ -18,6 +19,23 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+)
+
+const (
+	//DefaultIPAMTimeout is how long to wait for the IPAM plugin
+	DefaultIPAMTimeout = 10 * time.Second
+
+	//DefaultLockPath is the default path to store vxlan locks
+	DefaultLockPath = "/tmp"
+
+	//DefaultLockExt is the default extension of the lock file
+	DefaultLockExt = ".lock"
+
+	//NetworkAnnotation is the string key where we search for the name of the vxlan to join
+	NetworkAnnotation = "vxlan-cni.travishegner.com/NetworkName"
+
+	//AddressAnnotation is the string key where we search for the IP address requested
+	AddressAnnotation = "vxlan-cni.travishegner.com/RequestedAddress"
 )
 
 func main() {
@@ -131,145 +149,30 @@ func main() {
 	defer lock.Close()
 
 	ipamBin := vars.Path + string(os.PathSeparator) + conf.Ipam.Type
+	ipm := ipam.New(ipamBin, DefaultIPAMTimeout)
 
 	switch vars.Command {
 	case "ADD":
-		ipm := ipam.New(ipamBin, DefaultIPAMTimeout)
-
-		//get/create host interface
-		hi, err := hostint.GetOrCreateHostInterface(vxlp, ipm)
+		output, err := handleAdd(ipm, vxlp, conf, vars)
 		if err != nil {
-			exitCode, exitOutput = cni.PrepareExit(err, 11, "failed to get or create host interface")
+			exitCode, exitOutput = cni.PrepareExit(err, 11, "failed to handle add command")
 			return
 		}
 
-		reqAddr := iputil.NetworkID(hi.Gateway)
-
-		reqAddress, ok := conf.Args.Annotations[AddressAnnotation]
-		if ok {
-			ip := net.ParseIP(reqAddress)
-			if ip != nil {
-				if hi.Gateway.Contains(ip) {
-					reqAddr.IP = ip
-				}
-			}
-		}
-
-		mvli, err := hi.GetMVLinkIndex()
-		if err != nil {
-			exitCode, exitOutput = cni.PrepareExit(err, 11, "failed to get link index for macvlan link")
-			return
-		}
-		result, err := ipm.Add(reqAddr, mvli, vxlp.ExcludeFirst, vxlp.ExcludeLast)
-		if err != nil {
-			exitCode, exitOutput = cni.PrepareExit(err, 11, "failure to get address from IPAM")
-			return
-		}
-
-		if len(result.IPs) < 1 || result.IPs[0].Address == "" {
-			exitCode, exitOutput = cni.PrepareExit(nil, 11, "no IP was found in ipam result")
-			return
-		}
-
-		rAddress := result.IPs[0].Address
-		log.WithField("Address", rAddress).Debugf("ipam returned address")
-
-		//add cmvl to host interface
-		addr, err := netlink.ParseIPNet(rAddress)
-		if err != nil {
-			exitCode, exitOutput = cni.PrepareExit(err, 11, "failed to parse address returned from ipam")
-			return
-		}
-
-		li, err := hi.AddContainerLink(vars.NetworkNamespace, vars.ContainerInterface, addr)
-		if err != nil {
-			log.WithError(err).Errorf("error adding contianer link")
-			exitCode, exitOutput = cni.PrepareExit(err, 11, "failed to add container link to the macvlan bridge")
-			mvli, err2 := hi.GetMVLinkIndex()
-			if err2 != nil {
-				log.WithError(err2).Errorf("error getting mvlink index")
-				exitCode, exitOutput = cni.PrepareExit(err2, 11, "failed to get link index for macvlan link")
-				return
-			}
-			err2 = ipm.Del(addr, mvli)
-			if err2 != nil {
-				log.WithError(err2).Errorf("failure while running ipam delete during add link error")
-			}
-			return
-		}
-
-		result.Interfaces = append(result.Interfaces, &cni.Interface{
-			Name:    vars.ContainerInterface,
-			Sandbox: vars.NetworkNamespace,
-		})
-
-		result.IPs[0].Gateway = hi.Gateway.IP.String()
-		result.IPs[0].Interface = &li
-
-		result.Routes = append(result.Routes, &cni.Route{
-			Destination: "0.0.0.0/0",
-			Gateway:     hi.Gateway.IP.String(),
-		})
-
-		exitOutput = result.Marshal()
+		os.Stdout.Write(output)
 		return
 	case "DEL":
-		ipm := ipam.New(ipamBin, DefaultIPAMTimeout)
-
-		hi, err := hostint.GetHostInterface(vxlp, ipm)
+		err := handleDel(ipm, vxlp, conf, vars)
 		if err != nil {
-			log.WithError(err).Errorf("failed to get host interface during DEL")
+			exitCode, exitOutput = cni.PrepareExit(err, 11, "failed to handle del command")
 			return
 		}
-
-		log.Debugf("deleting container link")
-		//delete cmvl
-		err = hi.DeleteContainerLink(vars.NetworkNamespace, vars.ContainerInterface)
-		if err != nil {
-			log.WithError(err).Errorf("failed to delete container link")
-		}
-
-		if conf.PreviousResult == nil || len(conf.PreviousResult.IPs) == 0 || conf.PreviousResult.IPs[0].Address == "" {
-			log.Errorf("address to delete missing from conf.PreviousResult")
-			return
-		}
-
-		addr, err := netlink.ParseIPNet(conf.PreviousResult.IPs[0].Address)
-		if err != nil {
-			log.Errorf("failed to parse address from previous result")
-			return
-		}
-
-		mvli, err := hi.GetMVLinkIndex()
-		if err != nil {
-			exitCode, exitOutput = cni.PrepareExit(err, 11, "failed to get link index for macvlan link")
-			return
-		}
-
-		err = ipm.Del(addr, mvli)
-		if err != nil {
-			log.WithError(err).Errorf("failure while running ipam delete")
-		}
-
-		nc, err := hi.NumContainers()
-		if err != nil {
-			log.WithError(err).Errorf("failed getting number of containers")
-			log.Warningf("leaving host interface in-tact")
-			return
-		}
-		log.Debugf("found %v containers on vxlan %v", nc, hi.VxlanParams.Name)
-		if nc == 0 {
-			hi.DeleteLinks()
-		}
-
-		//success
-		return
 	case "CHECK":
-		return
-		//if all "ADD" steps are correct
-		//exit 0
-		//else
-		//exit error
+		err := handleCheck(ipm, vxlp, conf, vars)
+		if err != nil {
+			exitCode, exitOutput = cni.PrepareExit(err, 11, "failed to handle check command")
+			return
+		}
 	default:
 		exitCode, exitOutput = cni.PrepareExit(fmt.Errorf("CNI_COMMAND was not set, or set to an invalid value"), 4, "invalid CNI_COMMAND")
 		return
@@ -319,4 +222,144 @@ func getK8sAnnotations(kubeconfig, namespace, podname string) map[string]string 
 
 	log.WithField("annotations", pod.Annotations).Debug("retrieved annotations")
 	return pod.Annotations
+}
+
+func handleAdd(ipm *ipam.Ipam, vxlp *vxlan.Vxlan, conf *vxlan.Config, vars *cni.Vars) ([]byte, error) {
+	message := fmt.Sprintf("handleAdd(%v, %v, %v, %v)", ipm, vxlp, conf, vars)
+	log.Debugf(message)
+	handlerr := func(err error) error {
+		log.WithError(err).Error(message)
+		return fmt.Errorf("%v: %w", message, err)
+	}
+
+	//get/create host interface
+	hi, err := hostint.GetOrCreate(vxlp, ipm)
+	if err != nil {
+		return nil, handlerr(fmt.Errorf("failed to get or create host interface: %w", err))
+	}
+
+	reqAddr := iputil.NetworkID(hi.Gateway)
+
+	reqAddress, ok := conf.Args.Annotations[AddressAnnotation]
+	if ok {
+		ip := net.ParseIP(reqAddress)
+		if ip != nil {
+			if hi.Gateway.Contains(ip) {
+				reqAddr.IP = ip
+			}
+		}
+	}
+
+	mvli, err := hi.GetMVLinkIndex()
+	if err != nil {
+		return nil, handlerr(fmt.Errorf("failed to get link index for macvlan link: %v", err))
+	}
+	result, err := ipm.Add(reqAddr, mvli, vxlp.ExcludeFirst, vxlp.ExcludeLast)
+	if err != nil {
+		return nil, handlerr(fmt.Errorf("failure to get address from IPAM: %v", err))
+	}
+
+	if len(result.IPs) < 1 || result.IPs[0].Address == "" {
+		return nil, handlerr(fmt.Errorf("no IP was found in ipam result"))
+	}
+
+	rAddress := result.IPs[0].Address
+	log.WithField("Address", rAddress).Debugf("ipam returned address")
+
+	//add cmvl to host interface
+	addr, err := netlink.ParseIPNet(rAddress)
+	if err != nil {
+		return nil, handlerr(fmt.Errorf("failed to parse address returned from ipam: %w", err))
+	}
+
+	li, err := hi.AddContainerLink(vars.NetworkNamespace, vars.ContainerInterface, addr)
+	if err != nil {
+		err = fmt.Errorf("failed to add container link: %w", err)
+		mvli, err2 := hi.GetMVLinkIndex()
+		if err2 != nil {
+			log.WithError(err2).Errorf("error getting mvlink index")
+			return nil, handlerr(err)
+		}
+		err2 = ipm.Del(addr, mvli)
+		if err2 != nil {
+			log.WithError(err2).Errorf("failure while running ipam delete during add link error")
+			return nil, handlerr(err)
+		}
+		return nil, handlerr(err)
+	}
+
+	result.Interfaces = append(result.Interfaces, &cni.Interface{
+		Name:    vars.ContainerInterface,
+		Sandbox: vars.NetworkNamespace,
+	})
+
+	result.IPs[0].Gateway = hi.Gateway.IP.String()
+	result.IPs[0].Interface = &li
+
+	result.Routes = append(result.Routes, &cni.Route{
+		Destination: "0.0.0.0/0",
+		Gateway:     hi.Gateway.IP.String(),
+	})
+
+	return result.Marshal(), nil
+}
+
+func handleDel(ipm *ipam.Ipam, vxlp *vxlan.Vxlan, conf *vxlan.Config, vars *cni.Vars) error {
+	message := fmt.Sprintf("handleDel(%v, %v, %v, %v)", ipm, vxlp, conf, vars)
+	log.Debugf(message)
+	handlerr := func(err error) error {
+		log.WithError(err).Error(message)
+		return fmt.Errorf("%v: %w", message, err)
+	}
+
+	hi, err := hostint.Get(vxlp, ipm)
+	if err != nil {
+		return handlerr(fmt.Errorf("failed to get host interface: %w", err))
+	}
+
+	log.Debugf("deleting container link")
+	//delete cmvl
+	err = hi.DeleteContainerLink(vars.NetworkNamespace, vars.ContainerInterface)
+	if err != nil {
+		return handlerr(fmt.Errorf("failed to delete container link: %w", err))
+	}
+
+	if conf.PreviousResult == nil || len(conf.PreviousResult.IPs) == 0 || conf.PreviousResult.IPs[0].Address == "" {
+		return handlerr(fmt.Errorf("address to delete missing from previous result"))
+	}
+
+	addr, err := netlink.ParseIPNet(conf.PreviousResult.IPs[0].Address)
+	if err != nil {
+		return handlerr(fmt.Errorf("failed to parse address from previous result: %w", err))
+	}
+
+	mvli, err := hi.GetMVLinkIndex()
+	if err != nil {
+		return handlerr(fmt.Errorf("failed to get link index for macvlan: %w", err))
+	}
+
+	err = ipm.Del(addr, mvli)
+	if err != nil {
+		log.WithError(err).Errorf("failure while running ipam delete")
+	}
+
+	nc, err := hi.NumContainers()
+	if err != nil {
+		log.WithError(err).Warningf("failed to get container count, leaving host interface in-tact")
+		return nil
+	}
+
+	log.Debugf("found %v containers on vxlan %v", nc, hi.VxlanParams.Name)
+	if nc == 0 {
+		log.Debugf("deleting host interface")
+		hi.DeleteLinks()
+	}
+
+	return nil
+}
+
+func handleCheck(ipm *ipam.Ipam, vxlp *vxlan.Vxlan, conf *vxlan.Config, vars *cni.Vars) error {
+	message := fmt.Sprintf("handleDel(%v, %v, %v, %v)", ipm, vxlp, conf, vars)
+	log.Debugf(message)
+	return nil
 }

@@ -34,6 +34,9 @@ type HostInterface struct {
 }
 
 const (
+	//DefaultVxlanRouteTable is the table index to store routes for directly connected networks
+	//this is necessary because the host prefixes are more specific and otherwise cause packets
+	//to be routed for directly connected networks
 	DefaultVxlanRouteTable = 192
 )
 
@@ -55,50 +58,50 @@ func newHostInterfaceShell(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, 
 	}, nil
 }
 
-// GetOrCreateHostInterface creates required host interfaces if they don't exist, or gets them if they already do
-func GetOrCreateHostInterface(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, error) {
-	hi, err := GetHostInterface(vxlan, ipm)
+// GetOrCreate creates required host interfaces if they don't exist, or gets them if they already do
+func GetOrCreate(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, error) {
+	log.Debugf("GetOrCreate(%v, %v)", vxlan, ipm)
+
+	hi, err := Get(vxlan, ipm)
 	if err == nil {
 		log.Debugf("found existing host interface, returning")
 		return hi, nil
 	}
 
-	return createHostInterface(vxlan, ipm)
+	return create(vxlan, ipm)
 }
 
-func createHostInterface(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, error) {
+func create(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, error) {
+	log.Debugf("create(%v, %v)", vxlan, ipm)
+
 	hi, err := newHostInterfaceShell(vxlan, ipm)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get host interface shell: %w", err)
 	}
 
 	err = hi.createVxlanLink()
 	if err != nil {
-		log.Error("failed to create vxlan link")
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed to craete vxlan link: %w", err)
 	}
 
 	hi.mvLink, err = hi.createMacvlanLink(hi.mvName)
 	if err != nil {
-		log.Error("failed to create host macvlan link")
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed to create host macvlan link: %w", err)
 	}
 
 	gwNet, err := netlink.ParseIPNet(hi.VxlanParams.Cidr)
 	if err != nil {
-		log.Error("failed to parse vxlan cidr")
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed to parse vxlan cidr %v: %w", hi.VxlanParams.Cidr, err)
 	}
 	hi.Prefix = iputil.NetworkID(gwNet)
 
 	result, err := hi.ipam.Add(gwNet, hi.mvLink.Index, hi.VxlanParams.ExcludeFirst, hi.VxlanParams.ExcludeLast)
 	if err != nil {
-		log.Errorf("failed to get address %v from ipam for host interface", gwNet)
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed to get address %v from ipam for host interface: %w", gwNet, err)
 	}
 
 	if len(result.IPs) < 1 || result.IPs[0].Address == "" {
@@ -108,47 +111,48 @@ func createHostInterface(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, er
 
 	gw, err := netlink.ParseIPNet(result.IPs[0].Address)
 	if err != nil {
-		log.Errorf("failed to parse address from IPAM result")
-		return nil, err
+		return nil, fmt.Errorf("failed to parse address from IPAM result: %w", err)
 	}
 
 	log.WithField("GatewayAddress", gw).Debugf("ipam returned address for host interface")
 
 	err = hi.initializeMacvlanLink(hi.mvLink, gw, netns.None(), "")
 	if err != nil {
-		log.Error("failed to initialize host macvlan link")
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize host macvlan link: %w", err)
 	}
 
 	hi.Gateway = gw
 	err = hi.addBypassRoute()
 	if err != nil {
-		log.Error("failed validating/adding bypass route")
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed validating/adding bypass route: %w", err)
 	}
 
 	err = hi.addBypassRule()
 	if err != nil {
-		log.Error("failed validating/adding bypass rule")
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed validating/adding bpyass rule: %w", err)
 	}
 
 	return hi, nil
 }
 
-func GetHostInterface(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, error) {
+//Get returns an existing valid host interface if the links exist, or an error
+//if the host interface is not valid or otherwise paritially configured
+//it will delete the remnants to allow a create to be called.
+func Get(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, error) {
+	log.Debugf("Get(%v, %v)", vxlan, ipm)
+
 	hi, err := newHostInterfaceShell(vxlan, ipm)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get host interface shell: %w", err)
 	}
 
 	var link netlink.Link
 	link, err = netlink.LinkByName(hi.vxName)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get vxlan link by name %v: %w", hi.vxName, err)
 	}
 
 	var ok bool
@@ -161,7 +165,7 @@ func GetHostInterface(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, error
 	link, err = netlink.LinkByName(hi.mvName)
 	if err != nil {
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed to get macvlan link by name %v: %w", hi.mvName, err)
 	}
 
 	hi.mvLink, ok = link.(*netlink.Macvlan)
@@ -173,13 +177,13 @@ func GetHostInterface(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, error
 	cidr, err := netlink.ParseIPNet(vxlan.Cidr)
 	if err != nil {
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed to parse vxlan cidr %v: %w", vxlan.Cidr, err)
 	}
 
 	err = hi.setGatewayAttribute(cidr)
 	if err != nil {
 		hi.DeleteLinks()
-		return nil, err
+		return nil, fmt.Errorf("failed to set gateway for host interface: %w", err)
 	}
 
 	return hi, nil
@@ -187,7 +191,8 @@ func GetHostInterface(vxlan *vxlan.Vxlan, ipm *ipam.Ipam) (*HostInterface, error
 
 //used to set the Gateway attribute, not the actual IP address on the actual link
 func (hi *HostInterface) setGatewayAttribute(cidr *net.IPNet) error {
-	log.Debugf("setGateway()")
+	log.Debugf("setGateway(%v)", cidr)
+
 	addrs, err := netlink.AddrList(hi.mvLink, netlink.FAMILY_ALL)
 	if err != nil {
 		return err
@@ -206,7 +211,7 @@ func (hi *HostInterface) setGatewayAttribute(cidr *net.IPNet) error {
 		}
 	}
 
-	return fmt.Errorf("expected address not found on macvlan link")
+	return fmt.Errorf("expected address %v not found on macvlan link", cidr)
 }
 
 func (hi *HostInterface) addBypassRule() error {
@@ -226,7 +231,6 @@ func (hi *HostInterface) addBypassRule() error {
 
 	err := netlink.RuleAdd(rule)
 	if err != nil {
-		log.WithError(err).Errorf("failed to add rule")
 		return err
 	}
 
@@ -266,7 +270,6 @@ func (hi *HostInterface) addBypassRoute() error {
 
 	r, _ := hi.getBypassRoute()
 	if r != nil {
-		log.Debugf("bypass route already exists, return")
 		return nil
 	}
 
@@ -276,7 +279,6 @@ func (hi *HostInterface) addBypassRoute() error {
 		Table:     DefaultVxlanRouteTable,
 	})
 	if err != nil {
-		log.WithError(err).Errorf("failed to add bypass route")
 		return err
 	}
 
@@ -315,14 +317,18 @@ func (hi *HostInterface) delBypassRoute() error {
 		return err
 	}
 
-	return netlink.RouteDel(r)
+	err = netlink.RouteDel(r)
+	if err != nil {
+		return fmt.Errorf("failed to delete bypass route: %w", err)
+	}
+
+	return nil
 }
 
 func (hi *HostInterface) createVxlanLink() error {
 	nl := &netlink.Vxlan{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: hi.vxName,
-			//MTU:  hi.VxlanParams.MTU,
 		},
 		VxlanId: hi.VxlanParams.ID,
 	}
@@ -391,12 +397,12 @@ func (hi *HostInterface) createVxlanLink() error {
 
 	err := netlink.LinkAdd(nl)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to add vxlan link: %w", err)
 	}
 
 	err = netlink.LinkSetUp(nl)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to set vxlan link up: %w", err)
 	}
 
 	hi.vxLink = nl
@@ -415,12 +421,12 @@ func (hi *HostInterface) createMacvlanLink(name string) (*netlink.Macvlan, error
 
 	err := netlink.LinkAdd(nl)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to add macvlan link: %w", err)
 	}
 
 	err = netlink.LinkSetUp(nl)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to set macvlan link up: %w", err)
 	}
 
 	return nl, nil
@@ -431,14 +437,14 @@ func (hi *HostInterface) initializeMacvlanLink(nl *netlink.Macvlan, addr *net.IP
 	defer runtime.UnlockOSThread()
 	rootns, err := netns.Get()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get root namespace: %w", err)
 	}
 	defer rootns.Close()
 
 	if ns.IsOpen() {
 		err = netlink.LinkSetNsFd(nl, int(ns))
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to move container macvlan into namespace: %w", err)
 		}
 
 		runtime.LockOSThread()
@@ -449,18 +455,18 @@ func (hi *HostInterface) initializeMacvlanLink(nl *netlink.Macvlan, addr *net.IP
 
 		err = netlink.LinkSetName(nl, ifname)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to set name of link: %w", err)
 		}
 
 		err = netlink.LinkSetUp(nl)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to set container macvlan up: %w", err)
 		}
 	}
 
 	err = netlink.AddrAdd(nl, &netlink.Addr{IPNet: addr})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to add address to macvlan: %w", err)
 	}
 
 	if ns.IsOpen() {
@@ -471,7 +477,7 @@ func (hi *HostInterface) initializeMacvlanLink(nl *netlink.Macvlan, addr *net.IP
 			Gw:  hi.Gateway.IP,
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to add default route to container namespace: %w", err)
 		}
 	}
 
@@ -488,13 +494,10 @@ func (hi *HostInterface) GetOption(opt string) (string, bool) {
 func (hi *HostInterface) AddContainerLink(namespace, ifname string, addr *net.IPNet) (int, error) {
 	cns, err := netns.GetFromPath(namespace)
 	defer func() {
-		err := cns.Close()
-		if err != nil {
-			log.Debugf("error while closing container namespace: %v", err)
-		}
+		cns.Close()
 	}()
 	if err != nil {
-		return -1, err
+		return -1, fmt.Errorf("failed to get container namespace: %w", err)
 	}
 
 	nsa := strings.Split(namespace, string(os.PathSeparator))
@@ -507,13 +510,13 @@ func (hi *HostInterface) AddContainerLink(namespace, ifname string, addr *net.IP
 	log.WithField("tempName", tempName).Debug("temporary interface name")
 	cmvl, err := hi.createMacvlanLink(tempName)
 	if err != nil {
-		return -1, err
+		return -1, fmt.Errorf("failed to create container macvlan: %w", err)
 	}
 
 	//addr add, move to namespace
 	err = hi.initializeMacvlanLink(cmvl, addr, cns, ifname)
 	if err != nil {
-		return -1, err
+		return -1, fmt.Errorf("failed to initialize container macvlan: %w", err)
 	}
 
 	return cmvl.Index, nil
@@ -523,13 +526,13 @@ func (hi *HostInterface) AddContainerLink(namespace, ifname string, addr *net.IP
 func (hi *HostInterface) DeleteContainerLink(namespace, name string) error {
 	rootns, err := netns.Get()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get root namespace: %w", err)
 	}
 	defer rootns.Close()
 
 	cns, err := netns.GetFromPath(namespace)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get container namespace: %w", err)
 	}
 	defer cns.Close()
 
@@ -538,44 +541,49 @@ func (hi *HostInterface) DeleteContainerLink(namespace, name string) error {
 
 	err = netns.Set(cns)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to set container namespace: %w", err)
 	}
 
 	link, err := netlink.LinkByName(name)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get container link by name: %w", err)
 	}
 
 	err = netlink.LinkDel(link)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete container link: %w", err)
 	}
 
-	return netns.Set(rootns)
+	err = netns.Set(rootns)
+	if err != nil {
+		return fmt.Errorf("failed to set back to root namespace: %w", err)
+	}
+
+	return nil
 }
 
 //DeleteLinks removes the components of the host interface from the host
 func (hi *HostInterface) DeleteLinks() {
-	log.Debugf("HostInterface.DeleteLinks()")
+	log.Debugf("hi.DeleteLinks()")
 	err := hi.delBypassRule()
 	if err != nil {
-		log.Errorf("failed to delete bypass rule: %v", err)
+		log.WithError(err).Warningf("failed to delete bypass rule")
 	}
 	err = hi.delBypassRoute()
 	if err != nil {
-		log.Errorf("failed to delete bypass route: %v", err)
+		log.WithError(err).Warningf("failed to delete bypass route:")
 	}
 
 	if hi.mvLink != nil {
 		if hi.Gateway != nil {
 			err = hi.ipam.Del(hi.Gateway, hi.mvLink.Index)
 			if err != nil {
-				log.Errorf("failed to delete gateway from IPAM")
+				log.WithError(err).Warningf("failed to delete gateway from IPAM")
 			}
 		}
 		err = netlink.LinkDel(hi.mvLink)
 		if err != nil {
-			log.Errorf("failed to delete macvlan link: %v", err)
+			log.WithError(err).Warningf("failed to delete macvlan link")
 		}
 		hi.mvLink = nil
 	}
@@ -583,42 +591,37 @@ func (hi *HostInterface) DeleteLinks() {
 	if hi.vxLink != nil {
 		err = netlink.LinkDel(hi.vxLink)
 		if err != nil {
-			log.Errorf("failed to delete vxlan link: %v", err)
+			log.WithError(err).Warningf("failed to delete vxlan link")
 		}
 		hi.vxLink = nil
 	}
 }
 
+//NumContainers returns the number of network namespaces with
+//child interfaces of the host's vxlan
 func (hi *HostInterface) NumContainers() (int, error) {
-
 	namespaces, err := getNetworkNamespaces()
 	if err != nil {
-		return -1, err
+		return -1, fmt.Errorf("failed to get network namespaces: %w", err)
 	}
 
 	numChildren := 0
 	for _, ns := range namespaces {
-		log.Debugf("checking for interfaces in namespace at %v", ns)
 		nsh, err := netns.GetFromPath(ns)
 		if err != nil {
-			log.WithError(err).Errorf("failed to get namespace at %v", ns)
-			return -1, err
+			return -1, fmt.Errorf("failed to get namespace at %v: %w", ns, err)
 		}
 		defer func() {
-			err := nsh.Close()
-			if err != nil {
-				log.WithError(err).Errorf("failed to close namespace at %v", ns)
-			}
+			nsh.Close()
 		}()
 		nlh, err := netlink.NewHandleAt(nsh, netlink.FAMILY_ALL)
 		if err != nil {
-			log.Errorf("failed to get netlink handle in namespace at %v", ns)
-			return -1, err
+			return -1, fmt.Errorf("failed to get netlink handle in namespaces at %v: %w", ns, err)
 		}
 
 		links, err := nlh.LinkList()
 		if err != nil {
-			return -1, err
+			return -1, fmt.Errorf("failed to list links in namespace at %v: %w", ns, err)
 		}
 		for _, link := range links {
 			if link.Attrs().ParentIndex == hi.vxLink.Index {
@@ -682,6 +685,7 @@ func getNetworkNamespaces() (map[string]string, error) {
 	return namespaces, nil
 }
 
+//GetMVLinkIndex gets the link index for the host's macvlan
 func (hi *HostInterface) GetMVLinkIndex() (int, error) {
 	if hi.mvLink == nil {
 		return -1, fmt.Errorf("no mcavlan link defined")
@@ -690,6 +694,7 @@ func (hi *HostInterface) GetMVLinkIndex() (int, error) {
 	return hi.mvLink.Index, nil
 }
 
+//GetVXLinkIndex gets the link index for the host's vxlan
 func (hi *HostInterface) GetVXLinkIndex() (int, error) {
 	if hi.vxLink == nil {
 		return -1, fmt.Errorf("no vxlan link defined")

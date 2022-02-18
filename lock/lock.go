@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/alexflint/go-filemutex"
@@ -17,7 +18,7 @@ type Lock struct {
 func NewLock(name, path, ext string) (*Lock, error) {
 	fm, err := filemutex.New(path + string(os.PathSeparator) + "vxlan-" + name + ext)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create new filemutex: %w", err)
 	}
 
 	return &Lock{

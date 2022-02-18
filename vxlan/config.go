@@ -2,6 +2,7 @@ package vxlan
 
 import (
 	"encoding/json"
+	"fmt"
 
 	cni "github.com/travishegner/go-libcni"
 )
@@ -21,7 +22,7 @@ func NewConfig(confBytes []byte) (*Config, error) {
 	conf := &Config{}
 	err := json.Unmarshal(confBytes, conf)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal confBytes: %w", err)
 	}
 
 	return conf, nil
